@@ -293,7 +293,7 @@ def analyze_drug_synergy(data_dir='data/processed', output_dir='results', cell_l
     if cell_lines is None:
         # Modify this list to include the cell lines you want to analyze
         # Ensure these correspond to your actual data files in the data/processed directory
-        cell_lines = ['A549', 'BT549', '786O']  # Add your cell lines here
+        cell_lines = ['A549', 'BT549', '786O', 'MDAMB231']  # Add your cell lines here
 
     # Set up dictionary to store results for each cell line
     all_results = {}
@@ -384,7 +384,7 @@ if __name__ == '__main__':
     parser.add_argument('--output-dir', type=str, default='results',
                         help='Directory to save results and figures')
     parser.add_argument('--cell-lines', type=str, nargs='+',
-                        help='Cell lines to analyze (default: A549, BT549, 786O)')
+                        help='Cell lines to analyze (default: A549, BT549, 786O, MDAMB231)')
     parser.add_argument('--bootstrap', action='store_true', help='Run with bootstrap analysis')
     parser.add_argument('--iterations', type=int, default=1000, help='Number of bootstrap iterations')
     parser.add_argument('--use-existing', action='store_true', help='Use existing analysis results instead of recomputing')

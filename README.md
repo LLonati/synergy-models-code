@@ -113,8 +113,8 @@ The package generates:
 ## Core Modules
 
 - `src/monotherapy.py`: Functions for fitting dose-response curves
-- `src/synergy.py`: Implementation of synergy models and bootstrap analysis
-- `src/visualization.py`: Visualization functions for creating plots
+- `src/synergy.py`: Implementation of ZIP synergy models and bootstrap analysis for calculating delta scores
+- `src/visualization.py`: Visualization functions for creating plots and heatmaps
 - `synergy_analysis.py`: Main execution script with command-line interface
 
 ## Dependencies
