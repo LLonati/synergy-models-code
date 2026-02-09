@@ -32,8 +32,12 @@ def _vectorized_4PL(doses, ec50, hill):
 
 def _create_dose_range(dose_min, dose_max, n_points=100, use_log=True):
     """Create dose range with appropriate scaling."""
+    if dose_min <= 0:
+        if use_log:
+            return np.logspace(np.log10(max(5e-3, dose_max / 1000)), np.log10(dose_max), n_points)
+        return np.linspace(0, dose_max, n_points)
     if use_log and dose_max / dose_min > 10:
-        return np.logspace(np.log10(max(dose_min, 1e-3)), np.log10(dose_max), n_points)
+        return np.logspace(np.log10(dose_min), np.log10(dose_max), n_points)
     return np.linspace(dose_min, dose_max, n_points)
 
 
@@ -43,7 +47,8 @@ def _format_axis(ax, xlabel, ylabel, title=None, fontsize=12, grid_alpha=0.3):
     ax.set_ylabel(ylabel, fontsize=fontsize)
     if title:
         ax.set_title(title, fontsize=fontsize + 2)
-    ax.grid(True, alpha=grid_alpha)
+    if grid_alpha > 0:
+        ax.grid(True, alpha=grid_alpha)
     ax.tick_params(axis='both', which='major', labelsize=fontsize - 2)
 
 
@@ -75,7 +80,7 @@ def _plot_monotherapy_for_cell_line(ax, results, dose_col, other_dose_col, param
         use_log = 'ecaii' in params_key.lower()
         dose_range = _create_dose_range(dose_min, dose_max, use_log=use_log)
         y_fit = _vectorized_4PL(dose_range, params['EC50'], params['Hill'])
-        ax.plot(dose_range, y_fit, '--', color=color_dict[cell_line], linewidth=linewidth)
+        ax.plot(dose_range, y_fit, '-', color=color_dict[cell_line], linewidth=linewidth)
 
 
 def _build_param_text(params_dict, cell_lines, params_key, unit):
@@ -118,7 +123,8 @@ def plot_monotherapy_curve(data, drug_col, effect_col, params, style=None, title
             ax.scatter(rep_data[drug_col], rep_data[effect_col], label=f'Rep {rep}', alpha=0.7)
 
     # Generate smooth curve from fitted parameters
-    x_range = _create_dose_range(data[drug_col].min(), data[drug_col].max(), use_log=True)
+    positive_doses = data[data[drug_col] > 0][drug_col]
+    x_range = _create_dose_range(positive_doses.min(), positive_doses.max(), use_log=True)
     y_fit = _vectorized_4PL(x_range, params['EC50'], params['Hill'])
     ax.plot(x_range, y_fit, 'r-', linewidth=2)
 
@@ -197,18 +203,18 @@ def plot_cell_line_monotherapy_comparison(results_dict, params_dict, cell_lines,
         ax.legend(fontsize=fontsize - 2)
         
         param_text = _build_param_text(params_dict, cell_lines, config['params_key'], config['unit'])
-        _add_text_box(ax, param_text, y=0.9, fontsize=fontsize - 1)
+        _add_text_box(ax, param_text, fontsize=fontsize - 1)
         ax.tick_params(width=2, length=6)
     
     fig.suptitle('Comparison of Monotherapy Response Across Cell Lines',
-                 fontsize=fontsize + 4, y=0.98, fontweight='bold')
+                 fontsize=fontsize + 4, fontweight='bold')
     plt.tight_layout()
     
     return fig
 
 
 def create_synergy_heatmap_base(results, value_to_plot='delta_score', cell_line=None,
-                                cmap='RdBu', vmin=-30, vmax=30, ax=None, annot=True,
+                                cmap='RdBu', vmin=-25, vmax=25, ax=None, annot=True,
                                 fontsize=12, mask_zeros=True, figsize=(10, 8)):
     """
     Plot heatmap of delta scores.
@@ -258,7 +264,7 @@ def create_synergy_heatmap_base(results, value_to_plot='delta_score', cell_line=
     
     # Set titles and labels
     title = f'{cell_line or ""} Synergy Delta Scores (ZIP Model)'
-    _format_axis(ax, 'X-ray dose (Gy)', 'EcAII concentration (U/ml)', title, fontsize)
+    _format_axis(ax, 'X-ray dose (Gy)', 'EcAII concentration (U/ml)', title, fontsize, grid_alpha=0)
 
     # Set colorbar properties after creating the heatmap
     cbar = ax.collections[0].colorbar  # Get the colorbar
@@ -333,7 +339,7 @@ def annotate_heatmap_with_ci(ax, bootstrap_results, significance_levels=None, fo
 
 
 def plot_synergy_heatmap_comparison(results_dict, bootstrap_dict=None, cell_lines=None,
-                                    fontsize=12, figsize=(18, 8)):
+                                    fontsize=12, figsize=None):
     """
     Create a figure comparing synergy heatmaps across cell lines.
     
@@ -394,7 +400,7 @@ def plot_synergy_heatmap_comparison(results_dict, bootstrap_dict=None, cell_line
 
 
 def plot_detailed_bootstrap_results(bootstrap_results, original_deltas, cell_line=None,
-                                    bootstrap_raw_iter=None, cmap='RdBu', vmin=-30, vmax=30, fontsize=12,
+                                    bootstrap_raw_iter=None, cmap='RdBu', vmin=-25, vmax=25, fontsize=12,
                                     figsize=(16, 12)):
     """
     Create detailed visualization of bootstrap results including confidence intervals.
@@ -532,7 +538,7 @@ def _plot_actual_vs_bootstrap(ax, bootstrap_results, original_deltas, fontsize):
 
 def panel_synergy_heatmap(results, params_drug1, params_drug2, params_shifts,
                           bootstrap_results=None, cell_line=None, grid_density=100,
-                          cmap='RdBu', vmin=-30, vmax=30, fontsize=12):
+                          cmap='RdBu', vmin=-25, vmax=25, fontsize=12):
     """
     Create a 4-panels figure for synergy visualization.
     
@@ -723,8 +729,279 @@ def _plot_panel4_delta_by_dose(ax, results, use_log, fontsize):
     ax.grid(True, alpha=0.3)
 
 
+def plot_contour_landscape(results, params_drug1, params_drug2, params_shifts,
+                           cell_line=None, grid_density=100, cmap='RdBu',
+                           vmin=-25, vmax=25, fontsize=12, figsize=(10, 8),
+                           highlight_thresholds=None):
+    """
+    Create a standalone contour landscape plot of delta scores with 
+    non-uniform levels that emphasize extreme synergy/antagonism regions.
+    
+    Parameters:
+    results: DataFrame with experimental data and calculated delta scores
+    params_drug1: dict, fitted parameters for drug 1
+    params_drug2: dict, fitted parameters for drug 2
+    params_shifts: dict, containing shift parameters for both directions
+    cell_line: str, name of cell line for title
+    grid_density: int, density of interpolation grid
+    cmap: str, colormap to use
+    vmin, vmax: float, limits for colormap (in percentage, e.g. -25 means -25%)
+    fontsize: int, font size for plot text
+    figsize: tuple, size of the figure
+    highlight_thresholds: list of floats, key percentage thresholds for contour lines
+                        (default: [-20, -15, -10, -5, 0, 5, 10, 15, 20])
+    
+    Returns:
+    fig: matplotlib figure
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Get experimental doses
+    exp_doses_E = np.sort(results['dose_E'].unique())
+    exp_doses_X = np.sort(results['dose_X'].unique())
+
+    # Create finer grid for smooth interpolation
+    dose_E_min, dose_E_max = np.min(exp_doses_E[exp_doses_E > 0]), np.max(exp_doses_E)
+    dose_X_min, dose_X_max = np.min(exp_doses_X[exp_doses_X > 0]), np.max(exp_doses_X)
+
+    fine_doses_E = _create_dose_range(dose_E_min, dose_E_max + 1, grid_density, dose_E_max / dose_E_min > 10)
+    fine_doses_X = _create_dose_range(dose_X_min, dose_X_max + 1, grid_density, dose_X_max / dose_X_min > 10)
+    fine_doses_E = np.sort(np.concatenate([[0], fine_doses_E]))
+    fine_doses_X = np.sort(np.concatenate([[0], fine_doses_X]))
+
+    # Create mesh grid for interpolation
+    X_fine, Y_fine = np.meshgrid(fine_doses_X, fine_doses_E)
+    Z_delta = _calculate_delta_surface(fine_doses_E, fine_doses_X, params_drug1, params_drug2, params_shifts)
+    masked_Z = np.ma.masked_invalid(Z_delta)
+    # --- Non-uniform filled levels: dense at extremes, sparser near zero ---
+    lower_extreme = np.linspace(vmin, -10, 8, endpoint=False)   # Dense in strong antagonism
+    middle = np.linspace(-10, 10, 11)                            # Sparser in neutral zone
+    upper_extreme = np.linspace(10, vmax, 8, endpoint=True)     # Dense in strong synergy
+    # Values are already in %, no conversion needed
+    levels_filled = np.unique(np.concatenate([lower_extreme, middle, upper_extreme]))
+    if highlight_thresholds is None:
+        highlight_thresholds = [-20, -15, -10, -5, 0, 5, 10, 15, 20]
+    # Filter thresholds within [vmin, vmax]
+    levels_lines = np.array([t for t in highlight_thresholds if vmin <= t <= vmax])
+
+    # Plot filled contours
+    cs = ax.contourf(X_fine, Y_fine, masked_Z * 100, levels=levels_filled,
+                     cmap=cmap, alpha=0.9, extend='both')
+    # Plot contour lines at key thresholds
+    contour = ax.contour(X_fine, Y_fine, masked_Z * 100, levels=levels_lines,
+                         colors='black', alpha=0.6, linewidths=0.8)
+    ax.clabel(contour, inline=True, fontsize=fontsize - 4, fmt='%.0f')
+
+    # Bold zero-line for reference
+    zero_contour = ax.contour(X_fine, Y_fine, masked_Z * 100, levels=[0],
+                              colors='black', linewidths=1.8, linestyles='--')
+
+    # Scatter experimental dose combinations
+    combo = results[(results['dose_E'] > 0) & (results['dose_X'] > 0)]
+    ax.scatter(combo['dose_X'], combo['dose_E'], color='black', s=25, marker='o',
+               zorder=5, edgecolors='white', linewidths=0.5)
+
+    # Set axis scales
+    if dose_E_max / dose_E_min > 10:
+        ax.set_yscale('log')
+    if dose_X_max / dose_X_min > 10:
+        ax.set_xscale('log')
+
+    # Colorbar
+    cbar = fig.colorbar(cs, ax=ax)
+    cbar.set_label('Delta Score %', fontsize=fontsize - 1)
+    cbar.ax.tick_params(labelsize=fontsize - 2)
+
+    # Title and labels
+    title = f'{cell_line} Synergy Contour Landscape (ZIP Model)' if cell_line else 'Synergy Contour Landscape (ZIP Model)'
+    ax.set_title(title, fontsize=fontsize + 2, fontweight='bold')
+    _format_axis(ax, 'X-ray dose (Gy)', 'EcAII concentration (U/ml)', None, fontsize)
+
+    plt.tight_layout()
+    return fig
+
+
+def _plot_single_contour_panel(ax, results, params_drug1, params_drug2, params_shifts,
+                                grid_density=100, cmap='RdBu', vmin=-25, vmax=25,
+                                fontsize=12, highlight_thresholds=None, cell_line=None):
+    """
+    Helper function to plot a single contour panel for one cell line.
+    
+    This function encapsulates the logic for creating the contour plot,
+    making it reusable by both plot_contour_landscape and plot_contour_landscape_comparison.
+    
+    Parameters:
+    ax: matplotlib axis to plot on
+    results: DataFrame with experimental data
+    params_drug1: dict, fitted parameters for drug 1 (EcAII)
+    params_drug2: dict, fitted parameters for drug 2 (X-ray)
+    params_shifts: dict, containing shift parameters for both directions
+    grid_density: int, density of interpolation grid
+    cmap: str, colormap to use
+    vmin, vmax: float, limits for colormap (percentage)
+    fontsize: int, font size for plot text
+    highlight_thresholds: list of floats, key percentage thresholds for contour lines
+    cell_line: str, name of cell line for title (optional)
+    
+    Returns:
+    cs: ContourSet object from contourf (for colorbar creation)
+    """
+    # Get experimental doses
+    exp_doses_E = np.sort(results['dose_E'].unique())
+    exp_doses_X = np.sort(results['dose_X'].unique())
+    
+    dose_E_min, dose_E_max = np.min(exp_doses_E[exp_doses_E > 0]), np.max(exp_doses_E)
+    dose_X_min, dose_X_max = np.min(exp_doses_X[exp_doses_X > 0]), np.max(exp_doses_X)
+
+    # Create finer grid for smooth interpolation
+    fine_doses_E = _create_dose_range(dose_E_min, dose_E_max + 1, grid_density, dose_E_max / dose_E_min > 10)
+    fine_doses_X = _create_dose_range(dose_X_min, dose_X_max + 1, grid_density, dose_X_max / dose_X_min > 10)
+    fine_doses_E = np.sort(np.concatenate([[0], fine_doses_E]))
+    fine_doses_X = np.sort(np.concatenate([[0], fine_doses_X]))
+
+    # Create mesh grid and calculate delta surface
+    X_fine, Y_fine = np.meshgrid(fine_doses_X, fine_doses_E)
+    Z_delta = _calculate_delta_surface(fine_doses_E, fine_doses_X, params_drug1, params_drug2, params_shifts)
+    masked_Z = np.ma.masked_invalid(Z_delta)
+
+    # Create non-uniform filled levels (dense at extremes, sparser near zero)
+    lower_extreme = np.linspace(vmin, -10, 8, endpoint=False)
+    middle = np.linspace(-10, 10, 11)
+    upper_extreme = np.linspace(10, vmax, 8, endpoint=True)
+    levels_filled = np.unique(np.concatenate([lower_extreme, middle, upper_extreme]))
+
+    # Set default highlight thresholds if not provided
+    if highlight_thresholds is None:
+        highlight_thresholds = [-20, -15, -10, -5, 0, 5, 10, 15, 20]
+    levels_lines = np.array([t for t in highlight_thresholds if vmin <= t <= vmax])
+
+    # Plot filled contours
+    cs = ax.contourf(X_fine, Y_fine, masked_Z * 100, levels=levels_filled,
+                     cmap=cmap, alpha=0.9, extend='both')
+
+    # Plot line contours at key thresholds
+    contour = ax.contour(X_fine, Y_fine, masked_Z * 100, levels=levels_lines,
+                         colors='black', alpha=0.6, linewidths=0.7)
+    ax.clabel(contour, inline=True, fontsize=fontsize - 4, fmt='%.0f')
+
+    # Bold zero line for reference
+    ax.contour(X_fine, Y_fine, masked_Z * 100, levels=[0],
+               colors='black', linewidths=1.5, linestyles='--')
+
+    # Scatter experimental dose combinations
+    combo = results[(results['dose_E'] > 0) & (results['dose_X'] > 0)]
+    ax.scatter(combo['dose_X'], combo['dose_E'], color='black', s=20, marker='o',
+               zorder=5, edgecolors='white', linewidths=0.4)
+
+    # Set axis scales
+    if dose_E_max / dose_E_min > 10:
+        ax.set_yscale('log')
+    if dose_X_max / dose_X_min > 10:
+        ax.set_xscale('log')
+
+    # Set title and labels
+    if cell_line:
+        ax.set_title(cell_line, fontsize=fontsize + 1, fontweight='bold')
+    
+    _format_axis(ax, 'X-ray dose (Gy)', 'EcAII conc. (U/ml)', None, fontsize - 1)
+
+    return cs
+
+
+
+def plot_contour_landscape_comparison(results_dict, params_dict, cell_lines=None,
+                                      grid_density=100, cmap='RdBu',
+                                      vmin=-25, vmax=25, fontsize=12, figsize=None,
+                                      highlight_thresholds=None):
+    """
+    Create a multi-panel figure comparing synergy contour landscapes across cell lines.
+    
+    Parameters:
+    results_dict: dict, mapping cell lines to their results DataFrames
+    params_dict: dict, mapping cell lines to their parameter dictionaries containing:
+                 {'params_ecaii': {...}, 'params_xray': {...}, 'params_shifts': {...}}
+    cell_lines: list, cell lines to include (if None, use all in results_dict)
+    grid_density: int, density of interpolation grid
+    cmap: str, colormap to use
+    vmin, vmax: float, limits for colormap (percentage)
+    fontsize: int, font size for plot text
+    figsize: tuple, size of the figure (auto-calculated if None)
+    highlight_thresholds: list of floats, key percentage thresholds for contour lines
+    
+    Returns:
+    fig: matplotlib figure
+    """
+    if cell_lines is None:
+        cell_lines = list(results_dict.keys())
+
+    # Filter to cell lines that have all required data
+    valid_cell_lines = []
+    for cl in cell_lines:
+        if cl in results_dict and cl in params_dict:
+            p = params_dict[cl]
+            if 'params_ecaii' in p and 'params_xray' in p and 'params_shifts' in p:
+                valid_cell_lines.append(cl)
+            else:
+                logger.warning(f"Skipping {cl} in contour comparison: missing params_ecaii, params_xray, or params_shifts.")
+        else:
+            logger.warning(f"Skipping {cl} in contour comparison: not found in results_dict or params_dict.")
+
+    if not valid_cell_lines:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.text(0.5, 0.5, "No valid cell lines for contour comparison",
+                ha='center', va='center', transform=ax.transAxes, fontsize=fontsize)
+        return fig
+
+    n = len(valid_cell_lines)
+    n_cols = min(3, n)
+    n_rows = (n + n_cols - 1) // n_cols
+
+    if figsize is None:
+        figsize = (7 * n_cols, 6 * n_rows + 1)
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False, constrained_layout=True)
+
+    if highlight_thresholds is None:
+        highlight_thresholds = [-20, -15, -10, -5, 0, 5, 10, 15, 20]
+
+    last_cs = None  # For shared colorbar
+
+    for idx, cell_line in enumerate(valid_cell_lines):
+        row, col = divmod(idx, n_cols)
+        ax = axes[row][col]
+
+        results = results_dict[cell_line]
+        params1 = params_dict[cell_line]['params_ecaii']
+        params2 = params_dict[cell_line]['params_xray']
+        params_shifts = params_dict[cell_line]['params_shifts']
+
+        cs = _plot_single_contour_panel(
+            ax, results, params1, params2, params_shifts,
+            grid_density=grid_density, cmap=cmap, vmin=vmin, vmax=vmax,
+            fontsize=fontsize, highlight_thresholds=highlight_thresholds,
+            cell_line=cell_line
+        )
+        if cs is not None:
+            last_cs = cs
+
+    # Hide unused subplots
+    for idx in range(n, n_rows * n_cols):
+        row, col = divmod(idx, n_cols)
+        axes[row][col].set_visible(False)
+
+    # Shared colorbar
+    if last_cs is not None:
+        cbar = fig.colorbar(last_cs, ax=axes.ravel().tolist(), shrink=0.8, aspect=30, pad=0.02)
+        cbar.set_label('Delta Score %', fontsize=fontsize - 1)
+        cbar.ax.tick_params(labelsize=fontsize - 2)
+
+    fig.suptitle('Synergy Contour Landscape Comparison (ZIP Model)',
+                 fontsize=fontsize + 4, fontweight='bold')
+    return fig
+
+
 def poster_synergy_heatmap(results, params_drug1, params_drug2, params_shifts,
-                          bootstrap_results=None, cell_line=None, cmap='RdBu', vmin=-30, vmax=30):
+                          bootstrap_results=None, cell_line=None, cmap='RdBu', vmin=-25, vmax=25):
     """
     Create poster-friendly synergy visualization with larger elements for better visibility.
     """    
@@ -859,7 +1136,8 @@ def plot_potency_shift_comparison(params_dict, cell_lines=None, fontsize=12, fig
     Compare potency shift parameters across cell lines.
     
     Parameters:
-    params_dict: dict, mapping cell lines to their parameter dictionaries
+    params_dict: dict, mapping cell lines to their parameter dictionaries containing:
+                 {'params_ecaii': {...}, 'params_xray': {...}, 'params_shifts': {...}}
     cell_lines: list, cell lines to include (if None, use all in params_dict)
     fontsize: int, font size for plot text
     figsize: tuple, size of the figure
@@ -874,9 +1152,9 @@ def plot_potency_shift_comparison(params_dict, cell_lines=None, fontsize=12, fig
     data = {'e_to_x_ec50': [], 'e_to_x_hill': [], 'x_to_e_ec50': [], 'x_to_e_hill': [], 'labels': []}
     
     for cell_line in cell_lines:
-        if cell_line not in params_dict or 'potency_shifts' not in params_dict[cell_line]:
+        if cell_line not in params_dict or 'params_shifts' not in params_dict[cell_line]:
             continue
-        shifts = params_dict[cell_line]['potency_shifts']
+        shifts = params_dict[cell_line]['params_shifts']
         if 'E_to_X' in shifts and 'X_to_E' in shifts:
             data['e_to_x_ec50'].append(shifts['E_to_X']['EC50'])
             data['e_to_x_hill'].append(shifts['E_to_X']['Hill'])

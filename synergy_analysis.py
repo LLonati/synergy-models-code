@@ -1,7 +1,9 @@
+import numpy as np
 from src.monotherapy import fit_monotherapy, logistic_4PL
 from src.synergy import calculate_delta_scores, get_potency_shifts, bootstrap_delta_scores
 import src.visualization as viz
 import pandas as pd
+import matplotlib.pyplot as plt
 import os
 import logging
 
@@ -22,14 +24,13 @@ def analyze_cell_line(data_path, cell_line, n_bootstrap=1000, confidence_level=0
     logger.info(f"Analyzing {cell_line}...")
 
     # Load data
-    data = pd.read_csv(data_path)
+    data = pd.read_csv(data_path, comment='#')
         
     # Check available columns and calculate inhibition appropriately
     logger.info(f"Available columns in {cell_line} data: {data.columns.tolist()}")
     
-    if 'live_normalized' in data.columns:
-        # Convert proliferation to inhibition
-        logger.info(f"Normalizing 'live_normalized' for {cell_line}.")
+    if 'live_normalized' in data.columns and 'inhibition' not in data.columns:
+        logger.info(f"Converting proliferation to inhibition for {cell_line}.")
         data['inhibition'] = 1 - data['live_normalized']
     elif 'inhibition' in data.columns:
         # Inhibition is already calculated
@@ -65,13 +66,15 @@ def analyze_cell_line(data_path, cell_line, n_bootstrap=1000, confidence_level=0
         style='bar',
         title=f'{cell_line}: EcAII Monotherapy'
     )
-    fig_ecaii.savefig(f'{output_dir}/figures/{cell_line}/ecaii_monotherapy.png')
+    fig_ecaii.savefig(f'{output_dir}/figures/{cell_line}/ecaii_monotherapy.png', dpi=300, bbox_inches='tight')
+    plt.close(fig_ecaii)
 
     fig_xray = viz.plot_monotherapy_curve(
         xray_mono, 'dose_X', 'inhibition', params_xray, style='bar',
         title = f'{cell_line}: X-ray Monotherapy', x_logscale=False
     )
-    fig_xray.savefig(f'{output_dir}/figures/{cell_line}/xray_monotherapy.png')
+    fig_xray.savefig(f'{output_dir}/figures/{cell_line}/xray_monotherapy.png', dpi=300, bbox_inches='tight')
+    plt.close(fig_xray)
 
     # Fit potency shift parameters using combination data
     logger.info(f"Fitting potency shift parameters for {cell_line}...")
@@ -107,6 +110,7 @@ def analyze_cell_line(data_path, cell_line, n_bootstrap=1000, confidence_level=0
         fontsize=15
     )
     fig_detailed.savefig(f'{output_dir}/figures/{cell_line}/detailed_bootstrap_results.png', dpi=300, bbox_inches='tight')
+    plt.close(fig_detailed)
 
     # Count significant synergistic and antagonistic combinations
     fig_publication = viz.panel_synergy_heatmap(
@@ -118,10 +122,28 @@ def analyze_cell_line(data_path, cell_line, n_bootstrap=1000, confidence_level=0
         cell_line=cell_line
     )
     fig_publication.savefig(f'{output_dir}/figures/{cell_line}/publication_quality_synergy.png', dpi=300, bbox_inches='tight')
-    
+    plt.close(fig_publication)
+
+    fig_contour = viz.plot_contour_landscape(
+        results=results,
+        params_drug1=params_ecaii,
+        params_drug2=params_xray,
+        params_shifts=params_shifts,
+        cell_line=cell_line,
+        grid_density=100,
+        cmap='RdBu',
+        vmin=-25,
+        vmax=25,
+        fontsize=12
+    )
+    fig_contour.savefig(f'{output_dir}/figures/{cell_line}/contour_landscape.png', dpi=300, bbox_inches='tight')
+    plt.close(fig_contour)
+    logger.info(f"Contour landscape saved for {cell_line}.")
+
     # Return the results for further analysis
     logger.info(f"Analysis completed for {cell_line}\n")
-    return results, bootstrap_results
+    return results, bootstrap_results, params_ecaii, params_xray, params_shifts
+
 
 
 def compare_cell_lines(results_dict, params_dict, bootstrap_dict=None, 
@@ -132,7 +154,7 @@ def compare_cell_lines(results_dict, params_dict, bootstrap_dict=None,
     Parameters:
     results_dict: dict, mapping cell lines to their results DataFrames
     params_dict: dict, mapping cell lines to their parameter dictionaries containing:
-                 {'params_ecaii': {...}, 'params_xray': {...}}
+                 {'params_ecaii': {...}, 'params_xray': {...}, 'params_shifts': {...}}
     bootstrap_dict: dict, mapping cell lines to their bootstrap results (optional)
     cell_lines: list, cell lines to include (if None, use all in results_dict)
     fontsize: int, font size for plot text
@@ -183,7 +205,7 @@ def compare_cell_lines(results_dict, params_dict, bootstrap_dict=None,
     # Figure 4: Potency shift parameter comparison
     # First, ensure potency shifts are included in params_dict
     for cell_line in cell_lines:
-        if cell_line in params_dict and 'potency_shifts' not in params_dict[cell_line]:
+        if cell_line in params_dict and 'params_shifts' not in params_dict[cell_line]:
             # Try to extract from results if available
             if cell_line in results_dict:
                 try:
@@ -193,7 +215,7 @@ def compare_cell_lines(results_dict, params_dict, bootstrap_dict=None,
                         params_dict[cell_line]['params_ecaii'], 
                         params_dict[cell_line]['params_xray']
                     )
-                    params_dict[cell_line]['potency_shifts'] = params_shifts
+                    params_dict[cell_line]['params_shifts'] = params_shifts
                 except Exception as e:
                     logger.warning(f"Could not calculate potency shifts for {cell_line}: {e}")
 
@@ -205,17 +227,30 @@ def compare_cell_lines(results_dict, params_dict, bootstrap_dict=None,
     )
     figures.append(fig_potency)
 
+    # Figure 5: Contour landscape comparison across cell lines
+    fig_contour_comp = viz.plot_contour_landscape_comparison(
+        results_dict=results_dict,
+        params_dict=params_dict,
+        cell_lines=cell_lines,
+        grid_density=100,
+        cmap='RdBu',
+        vmin=-25,
+        vmax=25,
+        fontsize=fontsize
+    )
+    figures.append(fig_contour_comp)
+
     return figures
 
 
 def load_existing_results(cell_lines, output_dir='results'):
     """
-    Load existing results for specified cell lines.
+    Load previously computed results for specified cell lines.
     
     Parameters:
     cell_lines: list of cell lines to load
     output_dir: str, directory where results are stored. (default: 'results')
-    
+
     Returns:
     Tuple of (all_results, all_params, all_bootstrap_results, loaded_cell_lines)
     """
@@ -244,10 +279,19 @@ def load_existing_results(cell_lines, output_dir='results'):
             
             params_ecaii = fit_monotherapy(mono_E, 'dose_E', 'inhibition')
             params_xray = fit_monotherapy(mono_X, 'dose_X', 'inhibition')
+            try:
+                params_shifts = get_potency_shifts(results, params_ecaii, params_xray, 
+                                                   drug_col1='dose_E', drug_col2='dose_X')
+                logging.info(f"Successfully calculated potency shifts for {cell_line}")
+            except Exception as e:
+                logging.warning(f"Could not calculate potency shifts for {cell_line}: {e}")
+                params_shifts = None
+            
             
             all_params[cell_line] = {
                 'params_ecaii': params_ecaii,
-                'params_xray': params_xray
+                'params_xray': params_xray,
+                'params_shifts': params_shifts
             }
             
             loaded_cell_lines.append(cell_line)
@@ -323,19 +367,21 @@ def analyze_drug_synergy(data_dir='data/processed', output_dir='results', cell_l
 
                 if with_bootstrap:
                     logger.info(f"Running analysis with bootstrap for {cell_line}...")
-                    results, bootstrap_results = analyze_cell_line(data_path, cell_line, n_bootstrap=nbootstrap, output_dir=output_dir)
+                    results, bootstrap_results, params_ecaii, params_xray, params_shifts = analyze_cell_line(
+                        data_path, cell_line, n_bootstrap=nbootstrap, output_dir=output_dir
+                    )
                     all_bootstrap_results[cell_line] = bootstrap_results
                 else:
-                    results, _ = analyze_cell_line(data_path, cell_line, output_dir=output_dir)
+                    results, _, params_ecaii, params_xray, params_shifts = analyze_cell_line(
+                        data_path, cell_line, output_dir=output_dir
+                    )
 
-                # Extract the parameters from your analysis
-                params_ecaii = fit_monotherapy(results[results['dose_X'] == 0], 'dose_E', 'inhibition')
-                params_xray = fit_monotherapy(results[results['dose_E'] == 0], 'dose_X', 'inhibition')
                 # Store results and parameters for this cell line
                 all_results[cell_line] = results
                 all_params[cell_line] = {
                     'params_ecaii': params_ecaii,
-                    'params_xray': params_xray
+                    'params_xray': params_xray,
+                    'params_shifts': params_shifts
                 }
             except Exception as e:
                 logging.error(f"Error processing {cell_line}: {e}")
@@ -355,6 +401,7 @@ def analyze_drug_synergy(data_dir='data/processed', output_dir='results', cell_l
     if figs_comparison:
         for i, fig in enumerate(figs_comparison):
             fig.savefig(f'{output_dir}/figures/comparison_synergy_{i}.png', dpi=400)
+            plt.close(fig)
         logger.info("Comparison figures saved.")
 
     logger.info("Analysis completed.")
