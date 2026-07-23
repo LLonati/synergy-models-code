@@ -1,6 +1,16 @@
 import numpy as np
+from typing import cast
 from src.monotherapy import fit_monotherapy, logistic_4PL
-from src.synergy import calculate_delta_scores, get_potency_shifts, bootstrap_delta_scores
+from src.synergy import (calculate_delta_scores, get_potency_shifts, bootstrap_delta_scores,
+                         bootstrap_model_scores, calculate_model_scores, classify_model_consensus)
+from src.power_analysis import (
+    convergence_diagnostics,
+    empirical_ci_coverage,
+    minimum_detectable_effect,
+    plot_convergence_diagnostics,
+    plot_mde_curve,
+    plot_ci_coverage,
+)
 import src.visualization as viz
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -19,12 +29,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def load_cell_line_data(data_path):
+    """Load a cell-line CSV and normalize the response column to `inhibition`."""
+    data = pd.read_csv(data_path, comment='#')
+    if 'live_normalized' in data.columns and 'inhibition' not in data.columns:
+        data['inhibition'] = 1 - data['live_normalized']
+    elif 'live' in data.columns and 'inhibition' not in data.columns:
+        data['inhibition'] = 1 - data['live']
+    return data
+
+
 def analyze_cell_line(data_path, cell_line, n_bootstrap=1000, confidence_level=0.95, output_dir='results'):
     """Run full analysis for one cell line."""
     logger.info(f"Analyzing {cell_line}...")
 
     # Load data
-    data = pd.read_csv(data_path, comment='#')
+    data = load_cell_line_data(data_path)
         
     # Check available columns and calculate inhibition appropriately
     logger.info(f"Available columns in {cell_line} data: {data.columns.tolist()}")
@@ -96,6 +116,7 @@ def analyze_cell_line(data_path, cell_line, n_bootstrap=1000, confidence_level=0
         n_bootstrap=n_bootstrap, confidence_level=confidence_level,
         drug_col1='dose_E', drug_col2='dose_X'
     )
+    bootstrap_results = cast(pd.DataFrame, bootstrap_results)
     # Save bootstrap results
     bootstrap_results.to_csv(f'{output_dir}/parameters/{cell_line}/{cell_line}_bootstrap_results.csv', index=False)
     logger.info(f"Bootstrap analysis completed for {cell_line}. Results saved in {output_dir}/parameters/{cell_line}/.")
@@ -144,6 +165,194 @@ def analyze_cell_line(data_path, cell_line, n_bootstrap=1000, confidence_level=0
     logger.info(f"Analysis completed for {cell_line}\n")
     return results, bootstrap_results, params_ecaii, params_xray, params_shifts
 
+
+
+def analyze_cell_line_multimodel(data_path, cell_line, models=('zip', 'bliss', 'hsa', 'loewe'),
+                                  n_bootstrap=1000, confidence_level=0.95, output_dir='results'):
+    """Run ZIP analysis + multi-model bootstrap for one cell line.
+
+    Extends ``analyze_cell_line`` by also running ``bootstrap_model_scores``
+    for the specified models and saving the per-model bootstrap summary CSV.
+
+    Parameters
+    ----------
+    data_path : str
+        Path to the normalised CSV for this cell line.
+    cell_line : str
+        Cell-line label used for directory and file names.
+    models : tuple of str
+        Synergy models to compare ('zip', 'bliss', 'hsa', 'loewe').
+    n_bootstrap : int
+        Bootstrap iterations.
+    confidence_level : float
+        Percentile CI level.
+    output_dir : str
+        Root directory for result files.
+
+    Returns
+    -------
+    results : DataFrame   — ZIP delta scores
+    bootstrap_results : DataFrame  — ZIP bootstrap summary
+    multimodel_bootstrap : DataFrame — multi-model bootstrap summary
+    params_ecaii, params_xray, params_shifts : dicts
+    """
+    # Run standard ZIP analysis (figures, ZIP bootstrap, delta scores)
+    results, bootstrap_results, params_ecaii, params_xray, params_shifts = analyze_cell_line(
+        data_path, cell_line, n_bootstrap=n_bootstrap,
+        confidence_level=confidence_level, output_dir=output_dir
+    )
+
+    # Load data again for multi-model bootstrap
+    data = load_cell_line_data(data_path)
+
+    logger.info(f"Running multi-model bootstrap ({models}) for {cell_line}...")
+    multimodel_bootstrap, _ = bootstrap_model_scores(
+        data=data,
+        params_drug1=params_ecaii,
+        params_drug2=params_xray,
+        models=models,
+        n_bootstrap=n_bootstrap,
+        confidence_level=confidence_level,
+        drug_col1='dose_E',
+        drug_col2='dose_X'
+    )
+
+    # Add point-estimate model scores and consensus
+    model_scores_df = results.copy()
+    for m in models:
+        model_scores_df = calculate_model_scores(
+            model_scores_df, params_ecaii, params_xray, model=m,
+            drug_col1='dose_E', drug_col2='dose_X'
+        )
+    model_scores_df = classify_model_consensus(model_scores_df, models=models)
+
+    # Save outputs
+    out_params = f'{output_dir}/parameters/{cell_line}'
+    os.makedirs(out_params, exist_ok=True)
+    multimodel_bootstrap.to_csv(f'{out_params}/{cell_line}_multimodel_bootstrap.csv', index=False)
+    model_scores_df.to_csv(f'{out_params}/{cell_line}_model_scores.csv', index=False)
+    logger.info(f"Multi-model results saved for {cell_line}.")
+
+    return results, bootstrap_results, multimodel_bootstrap, params_ecaii, params_xray, params_shifts
+
+
+def build_multimodel_summary_table(cell_lines, output_dir='results',
+                                   models=('zip', 'bliss', 'hsa', 'loewe')):
+    """Aggregate multi-model bootstrap CSVs into a single manuscript-ready table.
+
+    Loads ``{output_dir}/parameters/{cl}/{cl}_multimodel_bootstrap.csv`` for
+    each cell line and produces a summary DataFrame with one row per
+    (cell_line, dose_E, dose_X, model) containing mean deviation, 95% CI,
+    adjusted p-value, and effect classification.
+
+    Parameters
+    ----------
+    cell_lines : list of str
+    output_dir : str
+    models : tuple of str
+
+    Returns
+    -------
+    summary : DataFrame
+    """
+    rows = []
+    for cl in cell_lines:
+        path = f'{output_dir}/parameters/{cl}/{cl}_multimodel_bootstrap.csv'
+        if not os.path.exists(path):
+            logger.warning(f"Multi-model bootstrap not found for {cl}: {path}")
+            continue
+        df = pd.read_csv(path)
+        for _, row in df.iterrows():
+            for m in models:
+                if f'{m}_mean' not in df.columns:
+                    continue
+                rows.append({
+                    'cell_line': cl,
+                    'dose_E': row['dose_E'],
+                    'dose_X': row['dose_X'],
+                    'model': m,
+                    'deviation_mean': row[f'{m}_mean'],
+                    'deviation_lower': row[f'{m}_lower'],
+                    'deviation_upper': row[f'{m}_upper'],
+                    'p_value': row[f'{m}_p_value'],
+                    'p_adjusted': row[f'{m}_p_adjusted'],
+                    'significant': row[f'{m}_significant'],
+                    'effect_type': row[f'{m}_effect_type'],
+                })
+    summary = pd.DataFrame(rows)
+    return summary
+
+
+def run_power_diagnostics(bootstrap_iterations, dose_pairs_df, output_dir, cell_line,
+                          confidence_level=0.95, step_size=50,
+                          run_coverage=False, coverage_simulations=50,
+                          coverage_bootstrap=200, run_mde=False,
+                          mde_simulations=50, mde_bootstrap=200,
+                          mde_effect_sizes=None):
+    """Run and save power diagnostics for one cell line.
+
+    Always computes convergence diagnostics from raw bootstrap iterations.
+    Coverage and MDE analyses are optional because they are simulation-heavy.
+
+    Returns
+    -------
+    dict with keys that may include:
+      convergence_df, coverage_df, coverage_summary, mde_df
+    """
+    out_params = f'{output_dir}/parameters/{cell_line}'
+    out_figs = f'{output_dir}/figures/{cell_line}'
+    os.makedirs(out_params, exist_ok=True)
+    os.makedirs(out_figs, exist_ok=True)
+
+    outputs = {}
+
+    convergence_df = convergence_diagnostics(
+        bootstrap_iterations,
+        dose_pairs_df,
+        confidence_level=confidence_level,
+        step_size=step_size,
+    )
+    convergence_df.to_csv(f'{out_params}/{cell_line}_convergence_diagnostics.csv', index=False)
+    fig_conv = plot_convergence_diagnostics(
+        convergence_df,
+        confidence_level=confidence_level,
+    )
+    fig_conv.savefig(f'{out_figs}/{cell_line}_convergence_diagnostics.png', dpi=300, bbox_inches='tight')
+    plt.close(fig_conv)
+    outputs['convergence_df'] = convergence_df
+
+    if run_coverage:
+        coverage_df, coverage_summary = empirical_ci_coverage(
+            true_params_E={'EC50': 0.2, 'Hill': 1.5},
+            true_params_X={'EC50': 3.0, 'Hill': 1.2},
+            n_simulations=coverage_simulations,
+            n_bootstrap=coverage_bootstrap,
+            confidence_level=confidence_level,
+        )
+        coverage_df.to_csv(f'{out_params}/{cell_line}_ci_coverage.csv', index=False)
+        pd.DataFrame([coverage_summary]).to_csv(
+            f'{out_params}/{cell_line}_ci_coverage_summary.csv', index=False
+        )
+        fig_cov = plot_ci_coverage(coverage_df, coverage_summary)
+        fig_cov.savefig(f'{out_figs}/{cell_line}_ci_coverage.png', dpi=300, bbox_inches='tight')
+        plt.close(fig_cov)
+        outputs['coverage_df'] = coverage_df
+        outputs['coverage_summary'] = coverage_summary
+
+    if run_mde:
+        mde_df = minimum_detectable_effect(
+            n_bootstrap=mde_bootstrap,
+            n_simulations=mde_simulations,
+            effect_sizes=mde_effect_sizes,
+        )
+        mde_df.to_csv(f'{out_params}/{cell_line}_mde_table.csv', index=False)
+        fig_mde = plot_mde_curve(mde_df)
+        fig_mde.savefig(f'{out_figs}/{cell_line}_mde_curve.png', dpi=300, bbox_inches='tight')
+        plt.close(fig_mde)
+        outputs['mde_df'] = mde_df
+
+    logger.info(f"Power diagnostics saved for {cell_line}.")
+    return outputs
 
 
 def compare_cell_lines(results_dict, params_dict, bootstrap_dict=None, 
@@ -311,7 +520,13 @@ def load_existing_results(cell_lines, output_dir='results'):
 
 def analyze_drug_synergy(data_dir='data/processed', output_dir='results', cell_lines=None,
                          with_bootstrap=True, nbootstrap=1000, use_existing=False,
-                         figsize=(18, 12), fontsize=18, linewidth=4, markersize=8):
+                         figsize=(18, 12), fontsize=18, linewidth=4, markersize=8,
+                         with_power_diagnostics=False, convergence_step_size=50,
+                         with_coverage=False, coverage_simulations=50,
+                         coverage_bootstrap=200, with_mde=False,
+                         mde_simulations=50, mde_bootstrap=200,
+                         mde_effect_sizes=None, with_multimodel=False,
+                         multimodel_models=('zip', 'bliss', 'hsa', 'loewe')):
     """Run analysis for specified cell lines or load existing results.
     
     Parameters:
@@ -325,7 +540,18 @@ def analyze_drug_synergy(data_dir='data/processed', output_dir='results', cell_l
     fontsize: int, font size for plots
     linewidth: int, line width for plots
     markersize: int, marker size for plots
-    
+    with_power_diagnostics: bool, whether to export convergence diagnostics
+    convergence_step_size: int, checkpoint interval for convergence diagnostics
+    with_coverage: bool, whether to run empirical CI coverage simulations
+    coverage_simulations: int, number of coverage simulation datasets
+    coverage_bootstrap: int, bootstrap iterations per coverage simulation
+    with_mde: bool, whether to run minimum detectable effect analysis
+    mde_simulations: int, number of simulation datasets per effect size
+    mde_bootstrap: int, bootstrap iterations per MDE simulation
+    mde_effect_sizes: sequence, optional effect sizes for MDE sweep
+    with_multimodel: bool, whether to export multimodel bootstrap and score tables
+    multimodel_models: tuple of str, model set for multimodel analysis
+
     Returns:
     tuple: (all_results, all_params) dictionaries with analysis results
 """
@@ -366,11 +592,51 @@ def analyze_drug_synergy(data_dir='data/processed', output_dir='results', cell_l
                     continue
 
                 if with_bootstrap:
-                    logger.info(f"Running analysis with bootstrap for {cell_line}...")
-                    results, bootstrap_results, params_ecaii, params_xray, params_shifts = analyze_cell_line(
-                        data_path, cell_line, n_bootstrap=nbootstrap, output_dir=output_dir
-                    )
+                    if with_multimodel:
+                        logger.info(f"Running ZIP + multimodel analysis with bootstrap for {cell_line}...")
+                        results, bootstrap_results, _, params_ecaii, params_xray, params_shifts = analyze_cell_line_multimodel(
+                            data_path,
+                            cell_line,
+                            models=multimodel_models,
+                            n_bootstrap=nbootstrap,
+                            output_dir=output_dir
+                        )
+                    else:
+                        logger.info(f"Running ZIP analysis with bootstrap for {cell_line}...")
+                        results, bootstrap_results, params_ecaii, params_xray, params_shifts = analyze_cell_line(
+                            data_path, cell_line, n_bootstrap=nbootstrap, output_dir=output_dir
+                        )
+
+                    bootstrap_results = cast(pd.DataFrame, bootstrap_results)
                     all_bootstrap_results[cell_line] = bootstrap_results
+
+                    if with_power_diagnostics:
+                        combo_dose_pairs = bootstrap_results[['dose_E', 'dose_X']].copy()
+                        power_data = load_cell_line_data(data_path)
+                        _, bootstrap_raw_iter = bootstrap_delta_scores(
+                            data=power_data,
+                            params_drug1=params_ecaii,
+                            params_drug2=params_xray,
+                            n_bootstrap=nbootstrap,
+                            confidence_level=0.95,
+                            drug_col1='dose_E',
+                            drug_col2='dose_X'
+                        )
+                        run_power_diagnostics(
+                            bootstrap_raw_iter,
+                            combo_dose_pairs,
+                            output_dir=output_dir,
+                            cell_line=cell_line,
+                            confidence_level=0.95,
+                            step_size=convergence_step_size,
+                            run_coverage=with_coverage,
+                            coverage_simulations=coverage_simulations,
+                            coverage_bootstrap=coverage_bootstrap,
+                            run_mde=with_mde,
+                            mde_simulations=mde_simulations,
+                            mde_bootstrap=mde_bootstrap,
+                            mde_effect_sizes=mde_effect_sizes,
+                        )
                 else:
                     results, _, params_ecaii, params_xray, params_shifts = analyze_cell_line(
                         data_path, cell_line, output_dir=output_dir
@@ -435,6 +701,26 @@ if __name__ == '__main__':
     parser.add_argument('--bootstrap', action='store_true', help='Run with bootstrap analysis')
     parser.add_argument('--iterations', type=int, default=1000, help='Number of bootstrap iterations')
     parser.add_argument('--use-existing', action='store_true', help='Use existing analysis results instead of recomputing')
+    parser.add_argument('--power-diagnostics', action='store_true',
+                        help='Export bootstrap convergence diagnostics per cell line')
+    parser.add_argument('--multimodel', action='store_true',
+                        help='Run multimodel analysis (ZIP, Bliss, HSA, Loewe) in addition to ZIP outputs')
+    parser.add_argument('--convergence-step-size', type=int, default=50,
+                        help='Checkpoint spacing for convergence diagnostics')
+    parser.add_argument('--coverage', action='store_true',
+                        help='Run empirical CI coverage simulations (slow)')
+    parser.add_argument('--coverage-simulations', type=int, default=50,
+                        help='Number of synthetic datasets for coverage analysis')
+    parser.add_argument('--coverage-bootstrap', type=int, default=200,
+                        help='Bootstrap iterations per coverage simulation')
+    parser.add_argument('--mde', action='store_true',
+                        help='Run minimum detectable effect analysis (slow)')
+    parser.add_argument('--mde-simulations', type=int, default=50,
+                        help='Simulation datasets per effect-size point for MDE')
+    parser.add_argument('--mde-bootstrap', type=int, default=200,
+                        help='Bootstrap iterations per MDE simulation')
+    parser.add_argument('--mde-effect-sizes', type=float, nargs='+',
+                        help='Optional effect sizes for MDE sweep')
     parser.add_argument('--fontsize', type=int, default=18, help='Font size for figures')
     parser.add_argument('--linewidth', type=int, default=4, help='Line width for plots')
     parser.add_argument('--figsize', type=parse_figsize, default=(18, 12), help='Figure size as width,height (e.g., 18,12)')
@@ -448,6 +734,16 @@ if __name__ == '__main__':
                          with_bootstrap=args.bootstrap, 
                          nbootstrap=args.iterations, 
                          use_existing=args.use_existing,
+                         with_power_diagnostics=args.power_diagnostics,
+                         convergence_step_size=args.convergence_step_size,
+                         with_coverage=args.coverage,
+                         coverage_simulations=args.coverage_simulations,
+                         coverage_bootstrap=args.coverage_bootstrap,
+                         with_mde=args.mde,
+                         mde_simulations=args.mde_simulations,
+                         mde_bootstrap=args.mde_bootstrap,
+                         mde_effect_sizes=args.mde_effect_sizes,
+                         with_multimodel=args.multimodel,
                          fontsize=args.fontsize,
                          linewidth=args.linewidth,
                          figsize=args.figsize,

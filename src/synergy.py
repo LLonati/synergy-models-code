@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from src.monotherapy import logistic_4PL, calculate_r_squared, fit_monotherapy
 from scipy.optimize import curve_fit
+from scipy.optimize import brentq
 from scipy import stats
 import logging
 from statsmodels.stats.multitest import multipletests
@@ -36,6 +37,162 @@ def calculate_zip_effect(dose1, dose2, params1, params2):
     
     # Calculate Bliss independence effect
     return y1 + y2 - y1 * y2
+
+def calculate_bliss_effect(dose1, dose2, params1, params2):
+    """Calculate expected effect based on Bliss independence.
+    This is equivalent to the ZIP baseline term before potency-shift corrections.
+    """
+    return calculate_zip_effect(dose1, dose2, params1, params2)
+
+
+def calculate_hsa_effect(dose1, dose2, params1, params2):
+    """Calculate expected effect based on HSA (Highest Single Agent)."""
+    y1 = 0 if dose1 == 0 else logistic_4PL(dose1, params1['EC50'], params1['Hill'])
+    y2 = 0 if dose2 == 0 else logistic_4PL(dose2, params2['EC50'], params2['Hill'])
+    return max(y1, y2)
+
+
+def logistic_inverse_effect(effect, params, eps=1e-9):
+    """Return dose that gives a target effect for 4PL modelwith bottom=0, top=1."""
+    ec50 = params.get('EC50')
+    hill = params.get('Hill')
+    if ec50 is None or hill is None:
+        raise ValueError("params must contain 'EC50' and 'Hill'")
+    if not np.isfinite(ec50) or not np.isfinite(hill) or ec50 <= 0 or hill <= 0:
+        raise ValueError("EC50 and Hill must be finite positive values")
+    
+    clipped = np.clip(effect, eps, 1 - eps)
+    return ec50 * (clipped / (1 - clipped)) ** (1.0 / hill)
+
+
+def calculate_loewe_effect(dose1, dose2, params1, params2, eps=1e-6):
+    """Calculate expected effect under Loewe additivity using an implicit solve.
+    For dose pair (d1,d2), solve y in:
+       d1 / D1(y) + d2 / D2(y) = 1
+    where Di(y) is inverse monotherapy dose-effect relation.
+    """
+    if dose1 == 0 and dose2 == 0:
+        return 0.0
+    if dose1 == 0:
+        return logistic_4PL(dose2, params2['EC50'], params2['Hill'])
+    if dose2 == 0:
+        return logistic_4PL(dose1, params1['EC50'], params1['Hill'])
+    
+    def loewe_residual(effect):
+        d1_effect = logistic_inverse_effect(effect, params1, eps=eps)
+        d2_effect = logistic_inverse_effect(effect, params2, eps=eps)
+        return (dose1 / d1_effect) + (dose2 / d2_effect) - 1.0
+    
+    lower = eps
+    upper = 1 - eps
+    r_low = loewe_residual(lower)
+    r_high = loewe_residual(upper)
+
+    if np.isnan(r_low) or np.isnan(r_high):
+        raise ValueError("Invalid Loewe residual values at bounds.")
+    
+    if r_low == 0:
+        return lower
+    if r_high == 0:
+        return upper
+    
+    if r_low * r_high > 0:
+        raise ValueError(
+            "Could not bracket a Loewe solution for the provided dose pair. "
+            f"Residual at lower bound: {r_low}, residual at upper bound: {r_high}."
+        )
+    
+    return brentq(loewe_residual, lower, upper)
+
+
+def calculate_expected_effect(dose1, dose2, params1, params2, model='zip'):    
+    """Dispatch expected-effect calculation across supported reference models."""
+    model_key = model.lower()
+    if model_key == 'zip':
+        return calculate_zip_effect(dose1, dose2, params1, params2)
+    if model_key == 'bliss':
+        return calculate_bliss_effect(dose1, dose2, params1, params2)
+    if model_key == 'hsa':
+        return calculate_hsa_effect(dose1, dose2, params1, params2)
+    if model_key == 'loewe':    
+        return calculate_loewe_effect(dose1, dose2, params1, params2)
+    raise ValueError(f"Unsupported model '{model}'. Supported: zip, bliss, hsa, loewe")
+
+
+def calculate_model_scores(data, params_drug1, params_drug2, model='zip',
+                           drug_col1='dose_E', drug_col2='dose_X',
+                           observed_col='inhibition'):
+    """Create standardized per-dose model scores for a given model.
+    Output columns:
+      - expected_effect_{model}
+      - deviation_{model} = observed - expected
+      - effect_direction_{model}
+    """
+    if observed_col not in data.columns:
+        raise ValueError(f"Missing observed column '{observed_col}' in data")
+    
+    results = data.copy()
+    model_key = model.lower()
+    expected_col = f'expected_effect_{model_key}'
+    deviation_col = f'deviation_{model_key}'
+    direction_col = f'effect_direction_{model_key}'
+
+    combo_mask = (results[drug_col1] > 0) & (results[drug_col2] > 0)
+    results[expected_col] = np.nan
+
+    def _expected(row):
+        return calculate_expected_effect(
+            row[drug_col1], row[drug_col2], params_drug1, params_drug2, model=model_key
+        )
+    if combo_mask.any():
+        results.loc[combo_mask, expected_col] = results.loc[combo_mask].apply(_expected, axis=1)
+
+    results[deviation_col] = np.nan
+    results.loc[combo_mask, deviation_col] = (
+        results.loc[combo_mask, observed_col] - results.loc[combo_mask, expected_col]
+    )
+
+    results[direction_col] = 'neutral'
+    results.loc[combo_mask & (results[deviation_col] > 0), direction_col] = 'synergistic'
+    results.loc[combo_mask & (results[deviation_col] < 0), direction_col] = 'antagonistic'
+
+    return results
+
+
+def classify_model_consensus(model_score_df, models=('zip', 'bliss', 'hsa', 'loewe'),
+                             consensus_rule='majority'):
+    """Classify consensus across multiple model-specific effect directions.
+
+    consensus_rule:
+      - 'majority': class with highest count among {synergistic, antagonistic, neutral}
+      - 'unanimous': only if all non-neutral classes match, else neutral
+    """
+    results = model_score_df.copy()
+    direction_cols = [f'effect_direction_{m.lower()}' for m in models]
+    missing = [c for c in direction_cols if c not in results.columns]
+    if missing:
+        raise ValueError(f"Missing direction columns for consensus: {missing}")
+    
+    def _consensus_row(row):
+        labels = [row[c] for c in direction_cols]
+        counts = {
+            'synergistic': labels.count('synergistic'),
+            'antagonistic': labels.count('antagonistic'),
+            'neutral': labels.count('neutral')
+        }
+        if consensus_rule == 'majority':
+            max_count = max(counts.values())
+            winners = [k for k, v in counts.items() if v == max_count]
+            return winners[0] if len(winners) == 1 else 'neutral'
+        if consensus_rule == 'unanimous':
+            non_neutral = [lab for lab in labels if lab != 'neutral']
+            if len(non_neutral) == len(labels) and len(set(non_neutral)) == 1:
+                return non_neutral[0]
+            return 'neutral'
+        raise ValueError("consensus_rule must be 'majority' or 'unanimous'")
+    
+    results['consensus_effect_type'] = results.apply(_consensus_row, axis=1)
+    return results
 
 
 def potency_shift_model(dose1, EC50, Hill, mono_effect2):
@@ -472,6 +629,153 @@ def bootstrap_delta_scores(data, params_drug1, params_drug2, n_bootstrap=1000,
     result_df = test_delta_scores_significance(result_df, alpha=alpha, method='fdr_bh')
 
     return result_df, bootstrap_iterations
+
+
+def bootstrap_model_scores(data, params_drug1, params_drug2, models=('zip', 'bliss', 'hsa', 'loewe'),
+                           n_bootstrap=1000, confidence_level=0.95,
+                           drug_col1='dose_E', drug_col2='dose_X'):
+    """Bootstrap uncertainty estimation for multi-model synergy scoring.
+
+    For each model in *models*, samples monotherapy parameters from their
+    estimated covariance distributions, recalculates potency shifts (ZIP/Bliss
+    only) and the per-model deviation for every unique combination dose pair,
+    and returns mean ± CI per dose pair per model.
+
+    Parameters
+    ----------
+    data : DataFrame
+        Experimental data (must contain drug_col1, drug_col2, 'inhibition').
+    params_drug1 : dict
+        Fitted monotherapy parameters for drug 1, incl. 'covariance_matrix'.
+    params_drug2 : dict
+        Fitted monotherapy parameters for drug 2, incl. 'covariance_matrix'.
+    models : tuple of str
+        Any subset of ('zip', 'bliss', 'hsa', 'loewe').
+    n_bootstrap : int
+        Number of bootstrap iterations.
+    confidence_level : float
+        Confidence level for percentile CI (default 0.95).
+    drug_col1, drug_col2 : str
+        Column names for the two drugs.
+
+    Returns
+    -------
+    summary_df : DataFrame
+        One row per unique combination dose pair, one set of columns per model:
+        {model}_mean, {model}_var, {model}_lower, {model}_upper,
+        {model}_p_value, {model}_p_adjusted, {model}_significant, {model}_effect_type
+    bootstrap_arrays : dict
+        Raw bootstrap deviations: { model: ndarray (n_combinations, n_bootstrap) }
+    """
+    try:
+        from tqdm import tqdm
+        iterator = tqdm(range(n_bootstrap), desc="Multi-model bootstrap")
+    except ImportError:
+        iterator = range(n_bootstrap)
+
+    for p, name in [(params_drug1, 'params_drug1'), (params_drug2, 'params_drug2')]:
+        if 'covariance_matrix' not in p:
+            raise ValueError(f"Missing covariance_matrix in {name}")
+
+    combo_mask = (data[drug_col1] > 0) & (data[drug_col2] > 0)
+    combo_data = data[combo_mask].copy()
+    if len(combo_data) == 0:
+        raise ValueError("No combination data found in dataset.")
+
+    unique_combos = combo_data.drop_duplicates([drug_col1, drug_col2])
+    n_combos = len(unique_combos)
+
+    params1_mean = np.array([params_drug1['EC50'], params_drug1['Hill']])
+    params2_mean = np.array([params_drug2['EC50'], params_drug2['Hill']])
+    cov1 = params_drug1['covariance_matrix']
+    cov2 = params_drug2['covariance_matrix']
+
+    # Raw iteration arrays: deviations (observed - expected) per model
+    boot_arrays = {m: np.zeros((n_combos, n_bootstrap)) for m in models}
+
+    for i in iterator:
+        p1_samp = np.random.multivariate_normal(params1_mean, cov1)
+        p2_samp = np.random.multivariate_normal(params2_mean, cov2)
+        p1 = {'EC50': p1_samp[0], 'Hill': p1_samp[1], 'covariance_matrix': cov1}
+        p2 = {'EC50': p2_samp[0], 'Hill': p2_samp[1], 'covariance_matrix': cov2}
+
+        # Potency shifts needed for ZIP/Bliss observed model
+        try:
+            ps = get_potency_shifts(data, p1, p2, drug_col1, drug_col2)
+        except Exception:
+            ps = None
+
+        for j, (_, row) in enumerate(unique_combos.iterrows()):
+            d1, d2 = row[drug_col1], row[drug_col2]
+            # Observed effect: mean of replicates for this dose pair
+            obs = data[(data[drug_col1] == d1) & (data[drug_col2] == d2)]['inhibition'].mean()
+
+            for m in models:
+                try:
+                    if m in ('zip', 'bliss'):
+                        exp = calculate_expected_effect(d1, d2, p1, p2, model=m)
+                        if ps is not None:
+                            # Use ZIP potency-shift observed model deviation (delta score)
+                            y_c_1to2 = potency_shift_model(d1, ps['E_to_X']['EC50'],
+                                                           ps['E_to_X']['Hill'],
+                                                           logistic_4PL(d2, p2['EC50'], p2['Hill']))
+                            y_c_2to1 = potency_shift_model(d2, ps['X_to_E']['EC50'],
+                                                           ps['X_to_E']['Hill'],
+                                                           logistic_4PL(d1, p1['EC50'], p1['Hill']))
+                            y_obs_model = (y_c_1to2 + y_c_2to1) / 2
+                            deviation = y_obs_model - exp
+                        else:
+                            deviation = obs - exp
+                    else:
+                        exp = calculate_expected_effect(d1, d2, p1, p2, model=m)
+                        deviation = obs - exp
+                    boot_arrays[m][j, i] = deviation
+                except Exception:
+                    boot_arrays[m][j, i] = np.nan
+
+    alpha = 1 - confidence_level
+    result_df = unique_combos[[drug_col1, drug_col2]].copy().reset_index(drop=True)
+
+    for m in models:
+        arr = boot_arrays[m]
+        means = np.nanmean(arr, axis=1)
+        vrs = np.nanvar(arr, axis=1)
+        lowers = np.nanpercentile(arr, 100 * alpha / 2, axis=1)
+        uppers = np.nanpercentile(arr, 100 * (1 - alpha / 2), axis=1)
+
+        p_values = np.zeros(n_combos)
+        min_p = 1.0 / n_bootstrap
+        for j in range(n_combos):
+            col = arr[j, :]
+            col = col[~np.isnan(col)]
+            if len(col) == 0:
+                p_values[j] = 1.0
+                continue
+            if means[j] > 0:
+                p_values[j] = max(min(np.sum(col <= 0) / len(col) * 2, 1.0), min_p)
+            else:
+                p_values[j] = max(min(np.sum(col >= 0) / len(col) * 2, 1.0), min_p)
+
+        _, p_adj, _, _ = multipletests(p_values, alpha=alpha, method='fdr_bh')
+        sig = p_adj < alpha
+        conditions = [
+            (sig & (means > 0)),
+            (sig & (means < 0)),
+            ~sig
+        ]
+        choices = ['synergistic', 'antagonistic', 'neutral']
+        effect = np.select(conditions, choices, default='neutral')
+
+        result_df[f'{m}_mean'] = means
+        result_df[f'{m}_var'] = vrs
+        result_df[f'{m}_lower'] = lowers
+        result_df[f'{m}_upper'] = uppers
+        result_df[f'{m}_p_value'] = p_values
+        result_df[f'{m}_p_adjusted'] = p_adj
+        result_df[f'{m}_significant'] = sig
+        result_df[f'{m}_effect_type'] = effect
+
+    return result_df, boot_arrays
 
 
 def test_delta_scores_significance(bootstrap_results, alpha=0.05, method='fdr_bh'):
